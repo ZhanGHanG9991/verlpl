@@ -1,5 +1,5 @@
 set -x
-export WANDB_API_KEY='975b4b9d4759ebc4c5ee764c39fe0e9034ae64f5'
+export WANDB_API_KEY='xxx'
 
 # 定义源模型路径和转换后的目标路径
 ORIGINAL_MODEL_PATH="/workspace/opt/models/Qwen2.5-0.5B-Instruct"
