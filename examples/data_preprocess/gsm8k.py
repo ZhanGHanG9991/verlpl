@@ -44,12 +44,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     local_dataset_path = args.local_dataset_path
 
-    data_source = "openai/gsm8k"
+    data_source = "gsm8k"  # 或 "openai/gsm8k"、你自己的名字
+
+    args = parser.parse_args()
+    local_dataset_path = args.local_dataset_path
+    if local_dataset_path is None:
+        local_dataset_path = "/workspace/opt/datasets/gsm8k"
 
     if local_dataset_path is not None:
-        dataset = datasets.load_dataset(local_dataset_path, "main")
+        # 本地路径只有 'default' 配置
+        dataset = datasets.load_dataset(local_dataset_path)  # 或 datasets.load_dataset(local_dataset_path, "default")
     else:
-        dataset = datasets.load_dataset(data_source, "main")
+        # 远程数据集，也只有 'default' 配置
+        dataset = datasets.load_dataset(data_source)  # 或 datasets.load_dataset(data_source, "default")
 
     train_dataset = dataset["train"]
     test_dataset = dataset["test"]

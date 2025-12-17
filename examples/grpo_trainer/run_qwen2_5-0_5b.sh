@@ -26,7 +26,7 @@ print(f"Loading model from {model_path}...")
 # 2. attn_implementation="flash_attention_2": 显式开启 FA2
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
-    dtype=torch.float16,
+    torch_dtype=torch.float16,
     attn_implementation="flash_attention_2",
     device_map="auto"
 )
@@ -54,8 +54,8 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=/workspace/opt/datasets/verl/gsm8k/train.parquet \
     data.val_files=/workspace/opt/datasets/verl/gsm8k/test.parquet \
     data.train_batch_size=64 \
-    data.max_prompt_length=4096 \
-    data.max_response_length=2048 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path=${FIXED_MODEL_PATH} \
@@ -68,11 +68,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.rollout.dtype=float16 \
-    actor_rollout_ref.model.save_dtype=float16 \
     actor_rollout_ref.ref.fsdp_config.model_dtype=float16 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=64 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
@@ -80,12 +79,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=64 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     algorithm.use_kl_in_reward=True \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_grpo_example_gsm8k' \
-    trainer.experiment_name='qwen2_0.5b_grpo_tp2' \
+    trainer.experiment_name='qwen2_5-0_5b_grpo_tp2' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
