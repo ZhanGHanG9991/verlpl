@@ -14,21 +14,21 @@ EXPERIMENTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_ROOT = os.path.dirname(EXPERIMENTS_DIR)
 
 pg_config = {
-    "host": os.getenv("POSTGRES_HOST", "localhost"),
-    "dbname": os.getenv("POSTGRES_DB", "xxx"),
-    "user": os.getenv("POSTGRES_USER", "xxx"),
-    "password": os.getenv("POSTGRES_PASSWORD", "xxx"),
-    "timeout": int(os.getenv("POSTGRES_TIMEOUT", 5000)),
-    "port": int(os.getenv("POSTGRES_PORT", 5432))
+    "host": "localhost",
+    "dbname": "postgres",
+    "user": "synsql",
+    "password": "123456",
+    "timeout": 5000,
+    "port": 5432
 }
 
 oc_config = {
-    "host": os.getenv("ORACLE_HOST", "localhost"),
-    "service_name": os.getenv("ORACLE_SERVICE_NAME", "XEPDB1"),
-    "user": os.getenv("ORACLE_USER", "xxx"),
-    "password": os.getenv("ORACLE_PASSWORD", "xxx"),
-    "timeout": int(os.getenv("ORACLE_TIMEOUT", 5000)),
-    "port": int(os.getenv("ORACLE_PORT", 1521))
+    "host": "localhost",
+    "service_name": "ORCLPDB1",
+    "user": "system",
+    "password": "MyPassword123",
+    "timeout": 5000,
+    "port": 1521
 }
 
 # ==========================================

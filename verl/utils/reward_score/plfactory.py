@@ -23,14 +23,6 @@ db_schema_graph_path = None
 db_schema_dict_path = None
 
 
-def initialize_dataset_paths(dataset_name: str):
-    global input_path, db_schema_graph_path, db_schema_dict_path
-    dataset_config = get_dataset_config(dataset_name)
-    input_path = dataset_config["dump_path"]
-    db_schema_graph_path = dataset_config["schema_graph_path"]
-    db_schema_dict_path = dataset_config["schema_dict_path"]
-
-
 def analyze_plsql_objects(plsql_code):
     objects = []
     patterns = [
