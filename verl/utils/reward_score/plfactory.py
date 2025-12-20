@@ -2,14 +2,17 @@ import os
 import re
 import json
 import subprocess
+from contextlib import contextmanager
+from pathlib import Path
 from typing import List, Optional
 
+import fcntl
 import psycopg
 from psycopg import sql as psql
 from psycopg import errors
 import pandas as pd
 
-from pl_setting import pg_config, get_dataset_config
+from .pl_setting import pg_config
 
 
 conn_info = f"host={pg_config['host']} user={pg_config['user']} password={pg_config['password']} dbname={pg_config['dbname']} port={pg_config['port']}"
@@ -18,9 +21,23 @@ port = pg_config['port']
 user = pg_config['user']
 password = pg_config['password']
 
-input_path = None
-db_schema_graph_path = None
-db_schema_dict_path = None
+input_path = "/workspace/opt/projects/researchprojects/plfactory/experiments/database/spider/postgres"
+db_schema_graph_path = "/workspace/opt/projects/researchprojects/plfactory/experiments/schema/spider/postgres_db_schema_graph.json"
+db_schema_dict_path = "/workspace/opt/projects/researchprojects/plfactory/experiments/schema/spider/postgres_db_schema_dict.json"
+
+LOCK_ROOT = Path(os.environ.get("PLFACTORY_DB_LOCK_DIR", "/tmp/plfactory_db_locks"))
+LOCK_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+@contextmanager
+def database_restore_lock(dbname: str):
+    lock_path = LOCK_ROOT / f"{dbname}.lock"
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def analyze_plsql_objects(plsql_code):
@@ -44,6 +61,43 @@ def get_plsql_type(plsql_code):
     for obj_type, _ in objects:
         return obj_type
     return 'unknown'
+
+
+def strip_think_blocks(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+
+
+def extract_plsql_content(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = strip_think_blocks(text).strip()
+    tag_pattern = r"<start-plsql>\s*(.*?)\s*(?:</end-plsql>|</start-plsql>|<end-plsql>)"
+    match = re.search(tag_pattern, text, re.DOTALL | re.IGNORECASE)
+    
+    if match:
+        return match.group(1).strip()
+    
+    # 1b. 如果没有结束标签，提取从 <start-plsql> 到文本末尾的内容
+    open_tag_pattern = r"<start-plsql>\s*(.*)"
+    match_open = re.search(open_tag_pattern, text, re.DOTALL | re.IGNORECASE)
+    
+    if match_open:
+        extracted = match_open.group(1).strip()
+        # 额外清理：移除可能的尾部其他标签或杂质
+        # 如果文本末尾有其他不相关的标签，可以在这里处理
+        return extracted
+    
+    # --- 策略 2: Markdown 兜底 (Markdown Fallback) ---
+    md_pattern = r"```(?:sql|plsql|pl/?sql)?\s*\n?(.*?)```"
+    match_md = re.search(md_pattern, text, re.DOTALL | re.IGNORECASE)
+    
+    if match_md:
+        return match_md.group(1).strip()
+    
+    # --- 策略 3: 最后的倔强 (Raw Strip) ---
+    return cleaned.strip()
 
 
 def execute_sql(database_conn_info, sql):
@@ -133,7 +187,10 @@ def recreate_databases(conn_info, databases, maintenance_db="postgres"):
                 )
                 ident = psql.Identifier(db_name)
                 cur.execute(psql.SQL("DROP DATABASE IF EXISTS {}").format(ident))
-                cur.execute(psql.SQL("CREATE DATABASE {}").format(ident))
+                try:
+                    cur.execute(psql.SQL("CREATE DATABASE {}").format(ident))
+                except psycopg.errors.DuplicateDatabase:
+                    pass
 
 
 def import_database(host, port, user, password, dbname, input_file):
@@ -143,13 +200,15 @@ def import_database(host, port, user, password, dbname, input_file):
 
 
 def restore_databases(conn_info, host, port, user, password, database_names):
-    try:
-        recreate_databases(conn_info, database_names)
-        for dbname in database_names:
+    for dbname in database_names:
+        with database_restore_lock(dbname):
+            recreate_databases(conn_info, [dbname])
+            if input_path is None:
+                raise ValueError("input_path is not configured for database restore.")
             input_file = os.path.join(input_path, f"{dbname}.sql")
-            import_database(host, port, user, password, dbname.lower(), input_file)
-    except Exception as e:
-        print(f"Error restoring databases {database_names}: {e}")
+            if not os.path.exists(input_file):
+                raise FileNotFoundError(f"SQL dump not found: {input_file}")
+            import_database(host, port, user, password, dbname, input_file)
 
 
 def compare_plsql_function(database_name, plsql1, plsql2, call_plsqls):
@@ -301,21 +360,26 @@ def compute_score(solution_str, ground_truth, extra_info, format_score=0.0, scor
     if not database_name:
         return 0.0
 
-    plsql_type = get_plsql_type(solution_str)
+    solution_sql = extract_plsql_content(solution_str)
+    ground_truth_sql = extract_plsql_content(ground_truth)
+    print("solution_sql: ", solution_sql)
+    # print("ground_truth_sql: ", ground_truth_sql)
+
+    plsql_type = get_plsql_type(solution_sql)
 
     try:
         if plsql_type == 'function':
             semantic_score = compare_plsql_function(
                 database_name=database_name,
-                plsql1=solution_str,
-                plsql2=ground_truth,
+                plsql1=solution_sql,
+                plsql2=ground_truth_sql,
                 call_plsqls=call_sqls
             )
         else:
             semantic_score = compare_plsql(
                 database_name=database_name,
-                plsql1=solution_str,
-                plsql2=ground_truth,
+                plsql1=solution_sql,
+                plsql2=ground_truth_sql,
                 call_plsqls=call_sqls,
                 include_system_tables=True
             )

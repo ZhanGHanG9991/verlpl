@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from tqdm import tqdm
-from verl.utils.reward_score.pl_setting import pg_config, get_dataset_config
+from pl_settings import pg_config, get_dataset_config
 
 # Connection info
 conn_info = f"host={pg_config['host']} user={pg_config['user']} password={pg_config['password']} dbname={pg_config['dbname']} port={pg_config['port']}"
@@ -37,9 +37,9 @@ def initialize_dataset_paths(dataset_name: str):
     global input_path, db_schema_graph_path, db_schema_dict_path
     
     dataset_config = get_dataset_config(dataset_name)
-    input_path = dataset_config["dump_path"]
-    db_schema_graph_path = dataset_config["schema_graph_path"]
-    db_schema_dict_path = dataset_config["schema_dict_path"]
+    input_path = "/workspace/opt/projects/researchprojects/plfactory/experiments/database/spider/postgres"
+    db_schema_graph_path = "/workspace/opt/projects/researchprojects/plfactory/experiments/schema/spider/postgres_db_schema_graph.json"
+    db_schema_dict_path = "/workspace/opt/projects/researchprojects/plfactory/experiments/schema/spider/postgres_db_schema_dict.json"
 
 def get_tables_info(database_name):
     conn_db_info = f"""host={host} dbname={database_name} user={user} password={password}"""

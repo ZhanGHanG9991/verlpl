@@ -23,7 +23,7 @@ from typing import Any, Dict, List
 
 import datasets
 
-from examples.data_preprocess import postgres_util
+import postgres_util
 from verl.utils.hdfs_io import copy, makedirs
 
 
@@ -147,11 +147,12 @@ def main():
     parser.add_argument(
         "--dataset_name",
         required=True,
+        default="pg_spider_procedures",
         help="Dataset name used by postgres_util to locate schema metadata.",
     )
     parser.add_argument(
         "--local_save_dir",
-        default="/home/zhanghang/opt/projects/researchprojects/plfactory/data",
+        default="/workspace/opt/projects/researchprojects/verlpl/examples/results",
         help="Directory to save the preprocessed Parquet files.",
     )
     parser.add_argument(
@@ -192,8 +193,8 @@ def main():
     train_dataset = train_raw.map(function=make_map_fn("train"), with_indices=True)
     test_dataset = test_raw.map(function=make_map_fn("test"), with_indices=True)
 
-    train_path = os.path.join(local_save_dir, "train.parquet")
-    test_path = os.path.join(local_save_dir, "test.parquet")
+    train_path = os.path.join(local_save_dir, "pg_spider_procedures_train.parquet")
+    test_path = os.path.join(local_save_dir, "pg_spider_procedures_test.parquet")
 
     train_dataset.to_parquet(train_path)
     test_dataset.to_parquet(test_path)

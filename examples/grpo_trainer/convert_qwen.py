@@ -3,8 +3,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
 
 # 使用 Shell 传入的路径
-model_path = "/workspace/opt/models/Qwen2.5-0.5B-Instruct"
-output_dir = "/workspace/opt/models/Qwen2.5-0.5B-Instruct-BF16-Fixed"
+model_path = "/workspace/opt/models/Qwen3-0.6B"
+output_dir = "/workspace/opt/models/Qwen3-0.6B-BF16-Fixed"
 
 print(f"Loading model from {model_path}...")
 
