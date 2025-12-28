@@ -27,7 +27,7 @@ input_path = None
 db_schema_graph_path = None
 db_schema_dict_path = None
 
-def initialize_dataset_paths(dataset_name: str):
+def initialize_dataset_paths():
     """
     根据数据集名称初始化路径配置
     
@@ -36,10 +36,10 @@ def initialize_dataset_paths(dataset_name: str):
     """
     global input_path, db_schema_graph_path, db_schema_dict_path
     
-    dataset_config = get_dataset_config(dataset_name)
-    input_path = "/workspace/opt/projects/researchprojects/plfactory/experiments/database/spider/postgres"
-    db_schema_graph_path = "/workspace/opt/projects/researchprojects/plfactory/experiments/schema/spider/postgres_db_schema_graph.json"
-    db_schema_dict_path = "/workspace/opt/projects/researchprojects/plfactory/experiments/schema/spider/postgres_db_schema_dict.json"
+    # dataset_config = get_dataset_config(dataset_name)
+    input_path = "/workspace/opt/projects/verlpl/examples/datasets/train/database/postgresql"
+    db_schema_graph_path = "/workspace/opt/projects/verlpl/examples/datasets/train/schema/postgres_db_schema_graph.json"
+    db_schema_dict_path = "/workspace/opt/projects/verlpl/examples/datasets/train/schema/postgres_db_schema_dict.json"
 
 def get_tables_info(database_name):
     conn_db_info = f"""host={host} dbname={database_name} user={user} password={password}"""
@@ -2685,7 +2685,7 @@ $$;"""
     
     return passed == total
 
-
+'''
 if __name__ == "__main__":
 
     print("=== Get Database Schema Graph Tests ===\n")
@@ -2774,3 +2774,4 @@ if __name__ == "__main__":
     # print("expect True")
     print(is_exact_match(f"""CREATE OR REPLACE PROCEDURE sp(para_state text, para_city text, para_bname text) LANGUAGE plpgsql AS $$ DECLARE ref_cursor CURSOR FOR SELECT * FROM bank WHERE \"state\" > para_state AND \"bname\" < para_bname; rec RECORD; BEGIN OPEN ref_cursor; LOOP FETCH ref_cursor INTO rec; EXIT WHEN NOT FOUND; UPDATE \"bank\" SET \"city\" = para_city WHERE CURRENT OF ref_cursor; END LOOP; CLOSE ref_cursor; END; $$;""",
                          f"""CREATE OR REPLACE PROCEDURE sp (para_state text, para_city text, para_bname text) LANGUAGE plpgsql   AS $$  \nDECLARE ref_cur CURSOR FOR SELECT * FROM bank WHERE \"state\" > para_state AND \"bname\" < para_bname; rec RECORD;   BEGIN OPEN ref_cur; LOOP FETCH ref_cur INTO rec; EXIT WHEN NOT FOUND; UPDATE \"bank\" SET \"city\" = para_city WHERE CURRENT OF ref_cur; END LOOP; CLOSE ref_cur; END; $$;"""))
+'''

@@ -51,6 +51,30 @@ RESULTS_DIR = os.path.join(EXPERIMENTS_DIR, "results")
 # 确保结果目录存在
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+# 覆盖表：当 dataset_name 命中这里时，直接使用手动配置
+DATASET_SCHEMA_OVERRIDES = {
+    "pg_plfactory": {
+        "path": None,  # 若确实没有 dataset json，可设为 None
+        "db_type": "postgres",
+        "object_type": "procedure",
+        "dataset_source": "plfactory",
+        "dump_path": "/workspace/opt/projects/plfactory/database/postgresql/plfactory",
+        "schema_path": "/workspace/opt/projects/plfactory/data/schema/plfactory",
+        "schema_graph_path": "/workspace/opt/projects/plfactory/data/schema/plfactory/postgres_db_schema_graph.json",
+        "schema_dict_path": "/workspace/opt/projects/plfactory/data/postgres_db_schema_dict.json",
+    },
+    "oc_plfactory": {
+        "path": None,
+        "db_type": "oracle",
+        "object_type": "procedure",
+        "dataset_source": "plfactory",
+        "dump_path": "/workspace/opt/projects/plfactory/database/oracle/plfactory",
+        "schema_path": "/workspace/opt/projects/plfactory/data/schema/plfactory",
+        "schema_graph_path": "/workspace/opt/projects/plfactory/data/schema/plfactory/oracle_db_schema_graph.json",
+        "schema_dict_path": "/workspace/opt/projects/plfactory/data/oracle_db_schema_dict.json",
+    },
+}
+
 
 def get_dataset_file_path(dataset_name: str) -> str:
     """
@@ -147,8 +171,8 @@ LLM_CALL_CONFIG = {
 # ==========================================
 # 数据库路径配置
 # ==========================================
-DATABASE_DUMP_PATH = "/workspace/opt/projects/researchprojects/plfactory/database/postgresql/"
-DATABASE_SCHEMA_PATH = "/workspace/opt/projects/researchprojects/plfactory/data/postgres_db_schema_dict.json"
+DATABASE_DUMP_PATH = "/workspace/opt/projects/plfactory/database/postgresql/"
+DATABASE_SCHEMA_PATH = "/workspace/opt/projects/plfactory/data/postgres_db_schema_dict.json"
 
 
 def extract_db_type_from_dataset_name(dataset_name: str) -> str:
@@ -319,6 +343,8 @@ def get_dataset_config(dataset_name: str) -> dict:
         ValueError: 如果数据集名称格式错误
         FileNotFoundError: 如果数据集文件不存在
     """
+    if dataset_name in DATASET_SCHEMA_OVERRIDES:
+        return DATASET_SCHEMA_OVERRIDES[dataset_name].copy()
     # 自动生成数据集文件路径
     dataset_path = get_dataset_file_path(dataset_name)
     

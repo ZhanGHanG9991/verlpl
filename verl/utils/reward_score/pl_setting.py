@@ -147,8 +147,8 @@ LLM_CALL_CONFIG = {
 # ==========================================
 # 数据库路径配置
 # ==========================================
-DATABASE_DUMP_PATH = "/workspace/opt/projects/researchprojects/plfactory/database/postgresql/"
-DATABASE_SCHEMA_PATH = "/workspace/opt/projects/researchprojects/plfactory/data/postgres_db_schema_dict.json"
+DATABASE_DUMP_PATH = "/workspace/opt/projects/plfactory/database/postgresql/"
+DATABASE_SCHEMA_PATH = "/workspace/opt/projects/plfactory/data/postgres_db_schema_dict.json"
 
 
 def extract_db_type_from_dataset_name(dataset_name: str) -> str:

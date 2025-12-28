@@ -2,8 +2,8 @@ set -x
 export WANDB_API_KEY='975b4b9d4759ebc4c5ee764c39fe0e9034ae64f5'
 
 # 定义源模型路径和转换后的目标路径
-ORIGINAL_MODEL_PATH="/workspace/opt/models/Qwen2.5-Coder-3B-Instruct-SFT"
-FIXED_MODEL_PATH="/workspace/opt/models/Qwen2.5-Coder-3B-Instruct-BF16"
+ORIGINAL_MODEL_PATH="/workspace/opt/models/plfactory-3b-sft"
+FIXED_MODEL_PATH="/workspace/opt/models/plfactory-3b-sft-bf16"
 
 # -----------------------------------------------------------------------------
 # 步骤 1: 创建并执行 Python 脚本，将模型转换为 bfloat16 并修复配置
@@ -51,8 +51,8 @@ python3 convert_qwen.py
 # -----------------------------------------------------------------------------
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/workspace/opt/projects/verlpl/examples/results/pg_spider_procedures_train.parquet \
-    data.val_files=/workspace/opt/projects/verlpl/examples/results/pg_spider_procedures_test.parquet \
+    data.train_files=/workspace/opt/projects/verlpl/examples/results/plfactory_rl_train.parquet \
+    data.val_files=/workspace/opt/projects/verlpl/examples/results/plfactory_rl_test.parquet \
     data.train_batch_size=16 \
     data.max_prompt_length=4096 \
     data.max_response_length=1024 \
@@ -76,7 +76,7 @@ python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.n=32 \
+    actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
@@ -84,9 +84,9 @@ python3 -u -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='rl-plfactory' \
-    trainer.experiment_name='qwen2_5-coder-3b-instruct-sft' \
-    trainer.n_gpus_per_node=8 \
+    trainer.experiment_name='plfactory-3b-sft-new' \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=26 \
+    trainer.save_freq=77 \
     trainer.test_freq=6 \
-    trainer.total_epochs=4 $@
+    trainer.total_epochs=2 $@

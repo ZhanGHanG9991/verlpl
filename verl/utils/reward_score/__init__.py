@@ -41,6 +41,12 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
+    print("----------------------------------------")
+    print("----------------------------------------")
+    print(f"[INFO] Processing completion for task: {data_source}")
+    print("----------------------------------------")
+    print("----------------------------------------")
+    
     if data_source == "gsm8k":
         from . import gsm8k
 
