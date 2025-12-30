@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 import psycopg
 from psycopg import sql as psql
 from psycopg import errors
+from psycopg_pool import ConnectionPool
 import pandas as pd
 import oracledb
 
@@ -34,6 +35,24 @@ pg_port = pg_config["port"]
 pg_user = pg_config["user"]
 pg_password = pg_config["password"]
 
+# PostgreSQL 连接池配置
+# 注意：max_connections=300 时，最大并发 worker 数 ≈ (300 - 维护池) / _PG_POOL_MAX_SIZE
+# 例如：(300 - 5) / 5 = 59 个并发 worker
+_PG_POOL_MIN_SIZE = 1
+_PG_POOL_MAX_SIZE = 5  # 每个 worker database 最多 5 个连接，节省总连接数
+_PG_POOL_TIMEOUT = 30.0
+_PG_POOL_IDLE_TIMEOUT = 60.0  # 1分钟未使用则清理，更积极地回收资源
+
+# 模板数据库缓存 (key: original_db_name, value: template_db_name)
+# 使用模板数据库可以大幅加速 CREATE DATABASE（利用 PostgreSQL 的 COW 机制）
+_template_db_cache: Dict[str, str] = {}
+_template_db_lock = threading.Lock()
+
+# 连接池缓存 (key: conninfo string, value: ConnectionPool)
+_pg_pools: Dict[str, ConnectionPool] = {}
+_pg_pool_last_used: Dict[str, float] = {}  # 记录最后使用时间
+_pg_pool_lock = threading.Lock()
+
 oc_conn_info = (
     f"host={oc_config['host']} "
     f"user={oc_config['user']} "
@@ -47,8 +66,152 @@ oc_user = oc_config["user"]
 oc_password = oc_config["password"]
 oc_service_name = oc_config["service_name"]
 
+# Oracle 连接重试配置
+_OC_MAX_RETRIES = 3
+_OC_RETRY_DELAY = 1.0
+# 可重试的 Oracle 错误关键字（小写匹配）
+_OC_RETRYABLE_ERRORS = [
+    'closed the connection',  # DPY-4011
+    'not connected',
+    'connection lost',
+    'dpy-4011',
+    'dpy-1001',
+    'timeout',
+    'ora-00600',  # Oracle 内部错误
+    'ora-27090',  # I/O 资源问题
+    'ora-03113',  # end-of-file on communication channel
+    'ora-03114',  # not connected to ORACLE
+    'ora-12170',  # TNS:Connect timeout
+    'ora-12541',  # TNS:no listener
+    'ora-12543',  # TNS:destination host unreachable
+]
+
 pg_input_path = "/workspace/opt/projects/verlpl/examples/datasets/train/database/postgresql"
 oc_input_path = "/workspace/opt/projects/verlpl/examples/datasets/train/database/oracle"
+
+
+# ============================================================
+# PostgreSQL 连接池管理
+# ============================================================
+
+def _make_worker_db_conninfo(dbname: str) -> str:
+    """统一构建 worker database 的 conninfo 字符串，确保格式一致"""
+    return psycopg.conninfo.make_conninfo(
+        host=pg_host,
+        port=pg_port,
+        user=pg_user,
+        password=pg_password,
+        dbname=dbname
+    )
+
+
+def _check_connection(conn) -> None:
+    """连接健康检查函数"""
+    try:
+        conn.execute("SELECT 1")
+    except Exception:
+        raise
+
+
+def _get_pg_pool(conninfo: str, open_now: bool = True) -> ConnectionPool:
+    """
+    获取或创建 PostgreSQL 连接池
+    
+    参数:
+        conninfo: 连接信息字符串
+        open_now: 是否立即打开连接池（默认True）
+                  对于 worker 数据库，应该在数据库创建后再打开
+    """
+    with _pg_pool_lock:
+        # 清理空闲过久的连接池
+        _cleanup_idle_pools_locked()
+        
+        if conninfo not in _pg_pools:
+            _pg_pools[conninfo] = ConnectionPool(
+                conninfo=conninfo,
+                min_size=_PG_POOL_MIN_SIZE,
+                max_size=_PG_POOL_MAX_SIZE,
+                timeout=_PG_POOL_TIMEOUT,
+                open=False,  # 延迟打开，避免连接到不存在的数据库
+                check=_check_connection,  # 添加连接健康检查
+            )
+        
+        pool = _pg_pools[conninfo]
+        
+        # 如果需要立即打开且连接池未打开
+        if open_now and pool.closed:
+            pool.open()
+        
+        # 更新最后使用时间
+        _pg_pool_last_used[conninfo] = time.time()
+        
+        return pool
+
+
+def _cleanup_idle_pools_locked():
+    """
+    清理长时间未使用的连接池（必须在持有锁的情况下调用）
+    
+    注意：不清理维护池（postgres数据库的连接池）
+    """
+    now = time.time()
+    maintenance_conninfo = psycopg.conninfo.make_conninfo(pg_conn_info, dbname="postgres")
+    
+    to_remove = []
+    for conninfo, last_used in list(_pg_pool_last_used.items()):
+        # 不清理维护池
+        if conninfo == maintenance_conninfo:
+            continue
+        # 检查是否超时
+        if now - last_used > _PG_POOL_IDLE_TIMEOUT:
+            to_remove.append(conninfo)
+    
+    for conninfo in to_remove:
+        try:
+            if conninfo in _pg_pools:
+                pool = _pg_pools[conninfo]
+                if not pool.closed:
+                    pool.close()
+                del _pg_pools[conninfo]
+            if conninfo in _pg_pool_last_used:
+                del _pg_pool_last_used[conninfo]
+        except Exception as e:
+            print(f"Warning: Failed to cleanup idle pool: {e}")
+
+
+def _get_pg_maintenance_pool() -> ConnectionPool:
+    """获取 postgres 维护数据库的连接池"""
+    maintenance_conninfo = psycopg.conninfo.make_conninfo(pg_conn_info, dbname="postgres")
+    return _get_pg_pool(maintenance_conninfo, open_now=True)
+
+
+def _close_pg_pool(conninfo: str):
+    """关闭并移除指定的连接池"""
+    with _pg_pool_lock:
+        if conninfo in _pg_pools:
+            try:
+                pool = _pg_pools[conninfo]
+                if not pool.closed:
+                    pool.close()
+            except Exception as e:
+                print(f"Warning: Error closing pool: {e}")
+            finally:
+                del _pg_pools[conninfo]
+        if conninfo in _pg_pool_last_used:
+            del _pg_pool_last_used[conninfo]
+
+
+def _ensure_pg_pool_open(conninfo: str) -> ConnectionPool:
+    """确保连接池已打开并返回"""
+    with _pg_pool_lock:
+        if conninfo in _pg_pools:
+            pool = _pg_pools[conninfo]
+            if pool.closed:
+                pool.open()
+            _pg_pool_last_used[conninfo] = time.time()
+            return pool
+    # 如果池不存在，创建并打开
+    return _get_pg_pool(conninfo, open_now=True)
 
 
 # ============================================================
@@ -229,40 +392,61 @@ def pg_extract_plsql_content(text: str) -> str:
     return _extract_plsql_content_impl(text, pg_strip_think_blocks)
 
 
-def pg_execute_sql(database_conn_info: str, sql: str):
+def pg_execute_sql(database_conn_info: str, sql: str, conn=None):
+    """执行 SQL，可复用已有连接（使用连接池）"""
     normalized = _normalize_plsql_block(sql)
     if not normalized:
         return
-    with psycopg.connect(database_conn_info) as conn:
+    
+    if conn is not None:
         with conn.cursor() as cur:
-            cur.execute("SET statement_timeout = %s;", (2 * 1000,))
+            cur.execute(f"SET statement_timeout = {2 * 1000};")
             cur.execute(normalized)
+        conn.commit()
+    else:
+        pool = _ensure_pg_pool_open(database_conn_info)
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = {2 * 1000};")
+                cur.execute(normalized)
 
 
-def pg_fetch_query_results(database_conn_info: str, query: str):
-    with psycopg.connect(database_conn_info) as conn:
+def pg_fetch_query_results(database_conn_info: str, query: str, conn=None):
+    """获取查询结果，可复用已有连接（使用连接池）"""
+    if conn is not None:
         with conn.cursor() as cur:
             cur.execute(query)
-            result = cur.fetchall()
-    return result
+            return cur.fetchall()
+    else:
+        pool = _ensure_pg_pool_open(database_conn_info)
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                return cur.fetchall()
 
 
-def pg_get_all_user_tables(database_name: str) -> List[str]:
-    conn_db_info = (
-        f"host={pg_host} dbname={database_name} user={pg_user} password={pg_password}"
-    )
-    with psycopg.connect(conn_db_info) as conn:
+def pg_get_all_user_tables(database_name: str, conn=None) -> List[str]:
+    """获取用户表列表，可复用已有连接（使用连接池）"""
+    def _fetch_tables(cur):
+        cur.execute(
+            """
+            SELECT tablename
+            FROM pg_catalog.pg_tables
+            WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY tablename;
+            """
+        )
+        return [row[0] for row in cur.fetchall()]
+    
+    if conn is not None:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT tablename
-                FROM pg_catalog.pg_tables
-                WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-                ORDER BY tablename;
-                """
-            )
-            result = cur.fetchall()
-    return [table_name[0] for table_name in result]
+            return _fetch_tables(cur)
+    else:
+        conn_db_info = _make_worker_db_conninfo(database_name)
+        pool = _ensure_pg_pool_open(conn_db_info)
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                return _fetch_tables(cur)
 
 
 def pg_get_important_system_tables() -> List[str]:
@@ -280,7 +464,8 @@ def pg_get_important_system_tables() -> List[str]:
 
 def pg_fetch_system_table_data(database_conn_info: str, system_table: str):
     try:
-        with psycopg.connect(database_conn_info) as conn:
+        pool = _ensure_pg_pool_open(database_conn_info)
+        with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -307,26 +492,136 @@ def pg_fetch_system_table_data(database_conn_info: str, system_table: str):
         return None
 
 
-def pg_recreate_database(conn_info: str, db_name: str, maintenance_db: str = "postgres"):
-    """重新创建单个数据库"""
-    dsn = psycopg.conninfo.make_conninfo(conn_info, dbname=maintenance_db)
-    with psycopg.connect(dsn) as conn:
+def _ensure_template_database(original_db_name: str) -> str:
+    """
+    确保模板数据库存在。如果不存在则创建。
+    
+    模板数据库命名: tpl_{original_db_name}
+    使用模板数据库的好处:
+    1. CREATE DATABASE ... TEMPLATE xxx 比 psql -f 快 5-10 倍
+    2. PostgreSQL 使用 COW (Copy-On-Write) 机制，几乎瞬间完成
+    
+    返回: 模板数据库名称
+    """
+    template_db_name = f"tpl_{original_db_name}"
+    
+    with _template_db_lock:
+        # 检查缓存
+        if original_db_name in _template_db_cache:
+            return _template_db_cache[original_db_name]
+        
+        # 检查模板数据库是否已存在
+        pool = _get_pg_maintenance_pool()
+        with pool.connection() as conn:
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM pg_database WHERE datname = %s",
+                    (template_db_name,)
+                )
+                exists = cur.fetchone() is not None
+        
+        if not exists:
+            # 创建模板数据库
+            print(f"Creating template database: {template_db_name} from {original_db_name}.sql ...")
+            input_file = os.path.join(pg_input_path, f"{original_db_name}.sql")
+            if not os.path.exists(input_file):
+                raise FileNotFoundError(f"SQL dump not found: {input_file}")
+            
+            # 创建空数据库
+            pg_recreate_database(pg_conn_info, template_db_name)
+            # 导入数据
+            pg_import_database(pg_host, pg_port, pg_user, pg_password, template_db_name, input_file)
+            print(f"Template database {template_db_name} created successfully.")
+        
+        _template_db_cache[original_db_name] = template_db_name
+        return template_db_name
+
+
+def pg_recreate_database_from_template(db_name: str, template_db_name: str):
+    """
+    使用模板数据库快速创建新数据库（比 psql -f 快 5-10 倍）
+    
+    PostgreSQL 的 CREATE DATABASE ... TEMPLATE 使用文件系统级别的复制，
+    对于小型数据库几乎是瞬间完成。
+    """
+    pool = _get_pg_maintenance_pool()
+    with pool.connection() as conn:
+        conn.rollback()
+        old_autocommit = conn.autocommit
         conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT pg_terminate_backend(pid)
-                FROM pg_stat_activity
-                WHERE datname = %s AND pid <> pg_backend_pid()
-                """,
-                (db_name,),
-            )
-            ident = psql.Identifier(db_name)
-            cur.execute(psql.SQL("DROP DATABASE IF EXISTS {}").format(ident))
+        try:
+            with conn.cursor() as cur:
+                # 终止目标数据库的所有连接
+                cur.execute(
+                    """
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = %s AND pid <> pg_backend_pid()
+                    """,
+                    (db_name,),
+                )
+                # 终止模板数据库的所有连接（创建时模板不能有活动连接）
+                cur.execute(
+                    """
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = %s AND pid <> pg_backend_pid()
+                    """,
+                    (template_db_name,),
+                )
+                
+                # DROP 目标数据库
+                ident = psql.Identifier(db_name)
+                cur.execute(psql.SQL("DROP DATABASE IF EXISTS {}").format(ident))
+                
+                # 从模板创建新数据库
+                template_ident = psql.Identifier(template_db_name)
+                try:
+                    cur.execute(
+                        psql.SQL("CREATE DATABASE {} TEMPLATE {}").format(ident, template_ident)
+                    )
+                except psycopg.errors.DuplicateDatabase:
+                    pass
+        finally:
+            # 安全恢复 autocommit，避免恢复失败时覆盖原始异常
             try:
-                cur.execute(psql.SQL("CREATE DATABASE {}").format(ident))
-            except psycopg.errors.DuplicateDatabase:
-                pass
+                conn.autocommit = old_autocommit
+            except Exception:
+                pass  # 连接可能已断开，忽略恢复失败
+
+
+def pg_recreate_database(conn_info: str, db_name: str, maintenance_db: str = "postgres"):
+    """重新创建单个数据库（使用连接池）- 空数据库版本"""
+    pool = _get_pg_maintenance_pool()
+    with pool.connection() as conn:
+        # 关键修复：从连接池获取的连接可能处于事务状态，
+        # 必须先回滚才能设置 autocommit
+        conn.rollback()
+        old_autocommit = conn.autocommit
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = %s AND pid <> pg_backend_pid()
+                    """,
+                    (db_name,),
+                )
+                ident = psql.Identifier(db_name)
+                cur.execute(psql.SQL("DROP DATABASE IF EXISTS {}").format(ident))
+                try:
+                    cur.execute(psql.SQL("CREATE DATABASE {}").format(ident))
+                except psycopg.errors.DuplicateDatabase:
+                    pass
+        finally:
+            # 安全恢复 autocommit，避免恢复失败时覆盖原始异常
+            try:
+                conn.autocommit = old_autocommit
+            except Exception:
+                pass  # 连接可能已断开，忽略恢复失败
 
 
 def pg_import_database(host, port, user, password, dbname, input_file):
@@ -355,13 +650,14 @@ def pg_import_database(host, port, user, password, dbname, input_file):
             print(f"Warnings/Notices:\n{process.stderr}")
 
 
-def pg_restore_database(worker_db_name: str, original_db_name: str):
+def pg_restore_database(worker_db_name: str, original_db_name: str, use_template: bool = True):
     """
-    恢复数据库（无锁版本）。
+    恢复数据库（高性能版本）。
     
     参数:
         worker_db_name: worker 专用的数据库名
-        original_db_name: 原始数据库名（用于查找 SQL 文件）
+        original_db_name: 原始数据库名（用于查找 SQL 文件或模板数据库）
+        use_template: 是否使用模板数据库加速（默认 True，快 5-10 倍）
     """
     input_file = os.path.join(pg_input_path, f"{original_db_name}.sql")
     
@@ -370,53 +666,129 @@ def pg_restore_database(worker_db_name: str, original_db_name: str):
             f"SQL dump not found: {input_file} (original db: {original_db_name})"
         )
     
-    pg_recreate_database(pg_conn_info, worker_db_name)
-    pg_import_database(
-        pg_host, pg_port, pg_user, pg_password, 
-        worker_db_name, input_file
-    )
+    # 关键修复：在 DROP 数据库之前先关闭对应的连接池
+    worker_conninfo = _make_worker_db_conninfo(worker_db_name)
+    _close_pg_pool(worker_conninfo)
+    
+    if use_template:
+        # 高性能路径：使用模板数据库
+        template_db_name = _ensure_template_database(original_db_name)
+        pg_recreate_database_from_template(worker_db_name, template_db_name)
+    else:
+        # 传统路径：DROP + CREATE + psql import
+        pg_recreate_database(pg_conn_info, worker_db_name)
+        pg_import_database(
+            pg_host, pg_port, pg_user, pg_password, 
+            worker_db_name, input_file
+        )
 
 
 def pg_cleanup_worker_database(worker_db_name: str):
-    """清理 worker 数据库"""
+    """清理 worker 数据库（使用连接池）"""
+    # 先关闭该 worker database 对应的连接池
+    worker_conninfo = _make_worker_db_conninfo(worker_db_name)
+    _close_pg_pool(worker_conninfo)
+    
     try:
-        dsn = psycopg.conninfo.make_conninfo(pg_conn_info, dbname="postgres")
-        with psycopg.connect(dsn) as conn:
+        pool = _get_pg_maintenance_pool()
+        with pool.connection() as conn:
+            # 关键修复：从连接池获取的连接可能处于事务状态，
+            # 必须先回滚才能设置 autocommit
+            conn.rollback()
+            old_autocommit = conn.autocommit
             conn.autocommit = True
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT pg_terminate_backend(pid)
-                    FROM pg_stat_activity
-                    WHERE datname = %s AND pid <> pg_backend_pid()
-                    """,
-                    (worker_db_name,),
-                )
-                ident = psql.Identifier(worker_db_name)
-                cur.execute(psql.SQL("DROP DATABASE IF EXISTS {}").format(ident))
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT pg_terminate_backend(pid)
+                        FROM pg_stat_activity
+                        WHERE datname = %s AND pid <> pg_backend_pid()
+                        """,
+                        (worker_db_name,),
+                    )
+                    ident = psql.Identifier(worker_db_name)
+                    cur.execute(psql.SQL("DROP DATABASE IF EXISTS {}").format(ident))
+            finally:
+                # 安全恢复 autocommit
+                try:
+                    conn.autocommit = old_autocommit
+                except Exception:
+                    pass
         print(f"Cleaned up worker database: {worker_db_name}")
     except Exception as exc:
         print(f"Warning: Failed to cleanup worker database {worker_db_name}: {exc}")
 
 
-def pg_capture_table_state(database_conn_info: str, table_names: List[str]) -> Dict[str, Optional[pd.DataFrame]]:
-    """批量抓取多个表的数据状态，复用单个连接以优化性能。"""
+def pg_cleanup_template_databases():
+    """
+    清理所有模板数据库（可选，通常不需要调用）。
+    模板数据库是持久化的，可以跨多次运行复用。
+    """
+    with _template_db_lock:
+        pool = _get_pg_maintenance_pool()
+        with pool.connection() as conn:
+            conn.rollback()
+            old_autocommit = conn.autocommit
+            conn.autocommit = True
+            try:
+                with conn.cursor() as cur:
+                    for original_db, template_db in list(_template_db_cache.items()):
+                        try:
+                            # 终止模板数据库的所有连接
+                            cur.execute(
+                                """
+                                SELECT pg_terminate_backend(pid)
+                                FROM pg_stat_activity
+                                WHERE datname = %s AND pid <> pg_backend_pid()
+                                """,
+                                (template_db,),
+                            )
+                            ident = psql.Identifier(template_db)
+                            cur.execute(psql.SQL("DROP DATABASE IF EXISTS {}").format(ident))
+                            print(f"Cleaned up template database: {template_db}")
+                        except Exception as exc:
+                            print(f"Warning: Failed to cleanup template database {template_db}: {exc}")
+            finally:
+                # 安全恢复 autocommit
+                try:
+                    conn.autocommit = old_autocommit
+                except Exception:
+                    pass
+        _template_db_cache.clear()
+
+
+def pg_capture_table_state(database_conn_info: str, table_names: List[str], conn=None) -> Dict[str, Optional[pd.DataFrame]]:
+    """批量抓取多个表的数据状态，可复用已有连接（使用连接池）。"""
     snapshots = {}
+    
+    def _capture(cur, connection):
+        for table in table_names:
+            try:
+                cur.execute(f'SELECT * FROM "{table}" ORDER BY 1;')
+                result = cur.fetchall()
+                columns = [desc[0] for desc in cur.description] if cur.description else []
+                snapshots[table] = pd.DataFrame(result, columns=columns)
+            except Exception as e:
+                print(f"Warning: Failed to capture table {table}: {e}")
+                snapshots[table] = None
+                # 关键修复：回滚事务以清除 aborted 状态，否则后续查询都会失败
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+    
     try:
-        with psycopg.connect(database_conn_info) as conn:
+        if conn is not None:
             with conn.cursor() as cur:
-                for table in table_names:
-                    try:
-                        cur.execute(f'SELECT * FROM "{table}" ORDER BY 1;')
-                        result = cur.fetchall()
-                        columns = [desc[0] for desc in cur.description] if cur.description else []
-                        snapshots[table] = pd.DataFrame(result, columns=columns)
-                    except Exception as e:
-                        print(f"Warning: Failed to capture table {table}: {e}")
-                        snapshots[table] = None
+                _capture(cur, conn)
+        else:
+            pool = _ensure_pg_pool_open(database_conn_info)
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    _capture(cur, conn)
     except Exception as e:
         print(f"Warning: Database connection failed: {e}")
-        # 连接失败，只将未处理的表设为 None，保留已成功获取的数据
         for table in table_names:
             if table not in snapshots:
                 snapshots[table] = None
@@ -430,49 +802,67 @@ def pg_compare_plsql_function(
     plsql2: str, 
     call_plsqls: List[str]
 ):
-    """比较两个 PL/SQL 函数"""
+    """比较两个 PL/SQL 函数（使用连接池）"""
     try:
-        database_conn_info = (
-            f"host={pg_host} user={pg_user} password={pg_password} dbname={worker_db_name}"
-        )
+        database_conn_info = _make_worker_db_conninfo(worker_db_name)
         
         # ========== 第一轮 ==========
         _log(worker_db_name, f"[Round 1] Restoring database from {original_db_name}.sql...")
         pg_restore_database(worker_db_name, original_db_name)
         
-        _log(worker_db_name, f"[Round 1] Executing solution PLSQL (function)...")
-        pg_execute_sql(database_conn_info, plsql1)
+        # 数据库创建后再获取/打开连接池
+        pool = _ensure_pg_pool_open(database_conn_info)
         
-        function_results1 = {}
-        _log(worker_db_name, f"[Round 1] Executing {len(call_plsqls)} call statement(s)...")
-        for i, call_plsql in enumerate(call_plsqls):
-            try:
-                _log(worker_db_name, f"[Round 1] Executing call [{i+1}]: {call_plsql[:100]}...")
-                result = pg_fetch_query_results(database_conn_info, call_plsql)
-                function_results1[i] = {"sql": call_plsql, "result": pd.DataFrame(result)}
-                _log(worker_db_name, f"[Round 1] Call [{i+1}] returned {len(result)} rows")
-            except Exception as exc:
-                _log(worker_db_name, f"[Round 1] Call [{i+1}] failed: {exc}", level="WARN")
-                function_results1[i] = {"sql": call_plsql, "result": None, "error": str(exc)}
+        # 在每轮内复用同一个连接
+        with pool.connection() as conn:
+            _log(worker_db_name, f"[Round 1] Executing solution PLSQL (function)...")
+            pg_execute_sql(database_conn_info, plsql1, conn=conn)
+            
+            function_results1 = {}
+            _log(worker_db_name, f"[Round 1] Executing {len(call_plsqls)} call statement(s)...")
+            for i, call_plsql in enumerate(call_plsqls):
+                try:
+                    _log(worker_db_name, f"[Round 1] Executing call [{i+1}]: {call_plsql[:100]}...")
+                    result = pg_fetch_query_results(database_conn_info, call_plsql, conn=conn)
+                    function_results1[i] = {"sql": call_plsql, "result": pd.DataFrame(result)}
+                    _log(worker_db_name, f"[Round 1] Call [{i+1}] returned {len(result)} rows")
+                except Exception as exc:
+                    _log(worker_db_name, f"[Round 1] Call [{i+1}] failed: {exc}", level="WARN")
+                    function_results1[i] = {"sql": call_plsql, "result": None, "error": str(exc)}
+                    # 关键修复：回滚事务以清除 aborted 状态，否则后续查询都会失败
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
         # ========== 第二轮 ==========
         _log(worker_db_name, f"[Round 2] Restoring database from {original_db_name}.sql...")
         pg_restore_database(worker_db_name, original_db_name)
         
-        _log(worker_db_name, f"[Round 2] Executing ground truth PLSQL (function)...")
-        pg_execute_sql(database_conn_info, plsql2)
+        # 数据库重建后需要重新打开连接池
+        pool = _ensure_pg_pool_open(database_conn_info)
         
-        function_results2 = {}
-        _log(worker_db_name, f"[Round 2] Executing {len(call_plsqls)} call statement(s)...")
-        for i, call_plsql in enumerate(call_plsqls):
-            try:
-                _log(worker_db_name, f"[Round 2] Executing call [{i+1}]: {call_plsql[:100]}...")
-                result = pg_fetch_query_results(database_conn_info, call_plsql)
-                function_results2[i] = {"sql": call_plsql, "result": pd.DataFrame(result)}
-                _log(worker_db_name, f"[Round 2] Call [{i+1}] returned {len(result)} rows")
-            except Exception as exc:
-                _log(worker_db_name, f"[Round 2] Call [{i+1}] failed: {exc}", level="WARN")
-                function_results2[i] = {"sql": call_plsql, "result": None, "error": str(exc)}
+        # 在每轮内复用同一个连接
+        with pool.connection() as conn:
+            _log(worker_db_name, f"[Round 2] Executing ground truth PLSQL (function)...")
+            pg_execute_sql(database_conn_info, plsql2, conn=conn)
+            
+            function_results2 = {}
+            _log(worker_db_name, f"[Round 2] Executing {len(call_plsqls)} call statement(s)...")
+            for i, call_plsql in enumerate(call_plsqls):
+                try:
+                    _log(worker_db_name, f"[Round 2] Executing call [{i+1}]: {call_plsql[:100]}...")
+                    result = pg_fetch_query_results(database_conn_info, call_plsql, conn=conn)
+                    function_results2[i] = {"sql": call_plsql, "result": pd.DataFrame(result)}
+                    _log(worker_db_name, f"[Round 2] Call [{i+1}] returned {len(result)} rows")
+                except Exception as exc:
+                    _log(worker_db_name, f"[Round 2] Call [{i+1}] failed: {exc}", level="WARN")
+                    function_results2[i] = {"sql": call_plsql, "result": None, "error": str(exc)}
+                    # 关键修复：回滚事务以清除 aborted 状态，否则后续查询都会失败
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
         # ========== 比较 ==========
         total_calls = len(call_plsqls)
@@ -521,40 +911,78 @@ def pg_compare_plsql(
     plsql2: str, 
     call_plsqls: List[str]
 ):
-    """比较两个 PL/SQL 对表的影响"""
+    """比较两个 PL/SQL 对表的影响（使用连接池）"""
     try:
-        database_conn_info = (
-            f"host={pg_host} user={pg_user} password={pg_password} dbname={worker_db_name}"
-        )
+        database_conn_info = _make_worker_db_conninfo(worker_db_name)
 
         # ========== 第一轮 ==========
         _log(worker_db_name, f"[Round 1] Restoring database from {original_db_name}.sql...")
         pg_restore_database(worker_db_name, original_db_name)
 
-        all_user_tables = pg_get_all_user_tables(worker_db_name)
-        _log(worker_db_name, f"[Round 1] Found {len(all_user_tables)} user tables: {all_user_tables}")
+        # 数据库创建后再获取/打开连接池
+        pool = _ensure_pg_pool_open(database_conn_info)
 
-        _log(worker_db_name, f"[Round 1] Executing solution PLSQL...")
-        pg_execute_sql(database_conn_info, plsql1)
-        _log(worker_db_name, f"[Round 1] Executing {len(call_plsqls)} call statement(s)...")
-        for i, call in enumerate(call_plsqls):
-            _log(worker_db_name, f"[Round 1] Executing call [{i+1}]: {call[:100]}...")
-            pg_execute_sql(database_conn_info, call)
+        # 在每轮内复用同一个连接
+        round1_call_failed = False
+        with pool.connection() as conn:
+            all_user_tables = pg_get_all_user_tables(worker_db_name, conn=conn)
+            _log(worker_db_name, f"[Round 1] Found {len(all_user_tables)} user tables: {all_user_tables}")
 
-        user_tables_results1 = pg_capture_table_state(database_conn_info, all_user_tables)
+            _log(worker_db_name, f"[Round 1] Executing solution PLSQL...")
+            try:
+                pg_execute_sql(database_conn_info, plsql1, conn=conn)
+            except Exception as e:
+                _log(worker_db_name, f"[Round 1] Failed to execute solution PLSQL: {e}", level="ERROR")
+                return 0.0
+            
+            _log(worker_db_name, f"[Round 1] Executing {len(call_plsqls)} call statement(s)...")
+            for i, call in enumerate(call_plsqls):
+                _log(worker_db_name, f"[Round 1] Executing call [{i+1}]: {call[:100]}...")
+                try:
+                    pg_execute_sql(database_conn_info, call, conn=conn)
+                except Exception as e:
+                    _log(worker_db_name, f"[Round 1] Call [{i+1}] failed: {e}", level="WARN")
+                    round1_call_failed = True
+                    # 关键修复：回滚事务以清除 aborted 状态，否则后续操作都会失败
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+            user_tables_results1 = pg_capture_table_state(database_conn_info, all_user_tables, conn=conn)
 
         # ========== 第二轮 ==========
         _log(worker_db_name, f"[Round 2] Restoring database from {original_db_name}.sql...")
         pg_restore_database(worker_db_name, original_db_name)
         
-        _log(worker_db_name, f"[Round 2] Executing ground truth PLSQL...")
-        pg_execute_sql(database_conn_info, plsql2)
-        _log(worker_db_name, f"[Round 2] Executing {len(call_plsqls)} call statement(s)...")
-        for i, call in enumerate(call_plsqls):
-            _log(worker_db_name, f"[Round 2] Executing call [{i+1}]: {call[:100]}...")
-            pg_execute_sql(database_conn_info, call)
+        # 数据库重建后需要重新打开连接池
+        pool = _ensure_pg_pool_open(database_conn_info)
+        
+        # 在每轮内复用同一个连接
+        round2_call_failed = False
+        with pool.connection() as conn:
+            _log(worker_db_name, f"[Round 2] Executing ground truth PLSQL...")
+            pg_execute_sql(database_conn_info, plsql2, conn=conn)
+            _log(worker_db_name, f"[Round 2] Executing {len(call_plsqls)} call statement(s)...")
+            for i, call in enumerate(call_plsqls):
+                _log(worker_db_name, f"[Round 2] Executing call [{i+1}]: {call[:100]}...")
+                try:
+                    pg_execute_sql(database_conn_info, call, conn=conn)
+                except Exception as e:
+                    _log(worker_db_name, f"[Round 2] Call [{i+1}] failed: {e}", level="WARN")
+                    round2_call_failed = True
+                    # 关键修复：回滚事务以清除 aborted 状态，否则后续操作都会失败
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
-        user_tables_results2 = pg_capture_table_state(database_conn_info, all_user_tables)
+            user_tables_results2 = pg_capture_table_state(database_conn_info, all_user_tables, conn=conn)
+
+        # 如果 solution 执行失败但 ground_truth 成功，返回 0
+        if round1_call_failed and not round2_call_failed:
+            _log(worker_db_name, f"[Compare] Solution calls failed but ground truth succeeded, returning 0.0")
+            return 0.0
 
         # ========== 比较 ==========
         _log(worker_db_name, f"[Compare] Comparing table states...")
@@ -679,46 +1107,206 @@ def oc_extract_plsql_content(text: str) -> str:
     return _extract_plsql_content_impl(text, oc_strip_think_blocks)
 
 
-def oc_get_connection(user: str = oc_user, password: str = oc_password):
-    return oracledb.connect(
-        user=user,
-        password=password,
-        host=oc_host,
-        port=oc_port,
-        service_name=oc_service_name,
-    )
+def oc_get_connection(user: str = oc_user, password: str = oc_password, max_retries: int = _OC_MAX_RETRIES):
+    """
+    获取 Oracle 连接（带重试和健康检查）
+    
+    参数:
+        user: 用户名，默认使用配置中的 oc_user
+        password: 密码，默认使用配置中的 oc_password
+        max_retries: 最大重试次数，默认使用 _OC_MAX_RETRIES
+    """
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            conn = oracledb.connect(
+                user=user,
+                password=password,
+                host=oc_host,
+                port=oc_port,
+                service_name=oc_service_name,
+            )
+            # 验证连接有效性
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM DUAL")
+            return conn
+        except oracledb.Error as e:
+            last_error = e
+            error_msg = str(e).lower()
+            # 使用统一的可重试错误列表
+            is_retryable = any(x in error_msg for x in _OC_RETRYABLE_ERRORS)
+            if is_retryable:
+                print(f"Oracle connection failed (attempt {attempt + 1}/{max_retries}): {e}, retryable=True")
+                if attempt < max_retries - 1:
+                    time.sleep(_OC_RETRY_DELAY * (attempt + 1))
+                    continue
+                else:
+                    print(f"Oracle connection: all {max_retries} retries exhausted")
+            raise
+    raise last_error
 
 
 def oc_split_sql_statements(sql_text: str) -> List[str]:
+    """
+    分割 Oracle SQL 语句，正确处理 PL/SQL 块。
+    
+    处理的情况：
+    1. 单引号和双引号内的分号
+    2. PL/SQL 块（BEGIN...END; 或 CREATE PROCEDURE/FUNCTION/TRIGGER...END;）
+    3. 使用 / 作为 PL/SQL 块结束符
+    4. 多行注释 /* ... */
+    5. 单行注释 -- ...
+    """
     statements = []
     buffer = []
-    in_single = False
-    in_double = False
-    for char in sql_text:
-        if char == "'" and not in_double:
-            in_single = not in_single
-        elif char == '"' and not in_single:
-            in_double = not in_double
-        if char == ";" and not in_single and not in_double:
-            statement = "".join(buffer).strip()
-            if statement and not statement.startswith("--"):
-                statements.append(statement)
-            buffer = []
-        else:
+    in_single_quote = False
+    in_double_quote = False
+    in_multiline_comment = False
+    in_plsql_block = False
+    plsql_depth = 0  # 跟踪嵌套的 BEGIN/END
+    
+    i = 0
+    text_upper = sql_text.upper()
+    n = len(sql_text)
+    
+    while i < n:
+        char = sql_text[i]
+        
+        # 处理多行注释 /* ... */
+        if not in_single_quote and not in_double_quote:
+            if i + 1 < n and sql_text[i:i+2] == '/*':
+                in_multiline_comment = True
+                buffer.append(sql_text[i:i+2])
+                i += 2
+                continue
+            if in_multiline_comment and i + 1 < n and sql_text[i:i+2] == '*/':
+                in_multiline_comment = False
+                buffer.append(sql_text[i:i+2])
+                i += 2
+                continue
+        
+        if in_multiline_comment:
             buffer.append(char)
+            i += 1
+            continue
+        
+        # 处理单行注释 -- ...
+        if not in_single_quote and not in_double_quote:
+            if i + 1 < n and sql_text[i:i+2] == '--':
+                # 跳到行尾
+                while i < n and sql_text[i] != '\n':
+                    buffer.append(sql_text[i])
+                    i += 1
+                if i < n:
+                    buffer.append(sql_text[i])  # 添加换行符
+                    i += 1
+                continue
+        
+        # 处理引号
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+        elif char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+        
+        in_quotes = in_single_quote or in_double_quote
+        
+        # 检测 PL/SQL 块的开始（CREATE PROCEDURE/FUNCTION/TRIGGER 或 DECLARE/BEGIN）
+        if not in_quotes and not in_plsql_block:
+            # 检查是否是 PL/SQL 块开始关键字
+            remaining = text_upper[i:]
+            # CREATE PROCEDURE/FUNCTION/TRIGGER/PACKAGE
+            if remaining.startswith('CREATE'):
+                # 查找是否包含 PROCEDURE/FUNCTION/TRIGGER/PACKAGE
+                next_100 = text_upper[i:i+100]
+                if any(kw in next_100 for kw in ['PROCEDURE', 'FUNCTION', 'TRIGGER', 'PACKAGE']):
+                    in_plsql_block = True
+                    plsql_depth = 0
+            # DECLARE 或独立的 BEGIN
+            elif remaining.startswith('DECLARE') or remaining.startswith('BEGIN'):
+                # 确保是单词边界
+                if i == 0 or not text_upper[i-1].isalnum():
+                    word_end = i + 7 if remaining.startswith('DECLARE') else i + 5
+                    if word_end >= n or not text_upper[word_end].isalnum():
+                        in_plsql_block = True
+                        plsql_depth = 1 if remaining.startswith('BEGIN') else 0
+        
+        # 在 PL/SQL 块中跟踪 BEGIN/END 嵌套
+        if in_plsql_block and not in_quotes:
+            remaining = text_upper[i:]
+            # 检测 BEGIN（确保是单词边界）
+            if remaining.startswith('BEGIN'):
+                if (i == 0 or not text_upper[i-1].isalnum()) and (i + 5 >= n or not text_upper[i+5].isalnum()):
+                    plsql_depth += 1
+            # 检测 END（确保是单词边界）
+            elif remaining.startswith('END'):
+                if (i == 0 or not text_upper[i-1].isalnum()) and (i + 3 >= n or not text_upper[i+3].isalnum()):
+                    plsql_depth -= 1
+                    if plsql_depth <= 0:
+                        # PL/SQL 块即将结束，找到下一个分号或 /
+                        pass  # 继续处理，等待分号
+        
+        # 处理分号
+        if char == ';' and not in_quotes:
+            buffer.append(char)
+            if in_plsql_block and plsql_depth <= 0:
+                # PL/SQL 块结束
+                statement = "".join(buffer).strip()
+                if statement and not statement.startswith("--"):
+                    statements.append(statement)
+                buffer = []
+                in_plsql_block = False
+                plsql_depth = 0
+            elif not in_plsql_block:
+                # 普通 SQL 语句结束
+                statement = "".join(buffer).strip()
+                # 移除结尾的分号（因为已经在 buffer 中了）
+                statement = statement.rstrip(';').strip()
+                if statement and not statement.startswith("--"):
+                    statements.append(statement)
+                buffer = []
+            i += 1
+            continue
+        
+        # 处理 / 作为 PL/SQL 块结束符（通常在行首）
+        if char == '/' and not in_quotes:
+            # 检查是否是行首的 /（作为 PL/SQL 结束符）
+            is_line_start = (i == 0 or sql_text[i-1] == '\n')
+            is_standalone = (i + 1 >= n or sql_text[i+1] in '\n\r \t')
+            if is_line_start and is_standalone and in_plsql_block:
+                # / 作为 PL/SQL 块结束符
+                statement = "".join(buffer).strip()
+                if statement and not statement.startswith("--"):
+                    statements.append(statement)
+                buffer = []
+                in_plsql_block = False
+                plsql_depth = 0
+                i += 1
+                continue
+        
+        buffer.append(char)
+        i += 1
+    
+    # 处理剩余内容
     tail = "".join(buffer).strip()
-    if tail:
+    # 移除结尾可能的 /
+    if tail.endswith('/'):
+        tail = tail[:-1].strip()
+    if tail and not tail.startswith("--"):
         statements.append(tail)
+    
     return statements
 
 
 def oc_execute_sql_statements_in_schema(sql_file: str, schema_name: str, password: str):
+    """从 SQL 文件执行语句到指定 schema"""
     with open(sql_file, "r", encoding="utf-8") as sql_handle:
         sql_content = sql_handle.read()
 
     statements = oc_split_sql_statements(sql_content)
     if not statements:
         raise ValueError(f"No valid SQL statements found in {sql_file}")
+    
+    print(f"Importing {len(statements)} statements from {os.path.basename(sql_file)} to {schema_name}...")
 
     with oc_get_connection(user=schema_name, password=password) as schema_conn:
         cursor = schema_conn.cursor()
@@ -753,7 +1341,10 @@ def oc_execute_sql_statements_in_schema(sql_file: str, schema_name: str, passwor
                 elif "does not exist" in error_msg and "drop" in stmt.lower():
                     continue
                 else:
+                    # 打印失败的 SQL 语句（截断显示）
+                    stmt_preview = stmt[:200] + "..." if len(stmt) > 200 else stmt
                     print(f"Warning: Failed to execute SQL [{idx}] in {schema_name}: {exc}")
+                    print(f"  SQL: {stmt_preview}")
                     continue
         schema_conn.commit()
     return success > 0
@@ -852,114 +1443,121 @@ def oc_cleanup_worker_schema(worker_schema_name: str):
         print(f"Warning: Failed to cleanup worker schema {worker_schema_name}: {exc}")
 
 
-def oc_execute_plsql(schema_name: str, plsql_code: str):
+def oc_execute_plsql(schema_name: str, plsql_code: str, conn=None):
+    """执行 PL/SQL 代码，可复用已有连接"""
     normalized = _normalize_plsql_block(plsql_code)
     if not normalized:
         return
-    with oc_get_connection() as conn:
+    
+    if conn is not None:
+        # 复用已有连接
         with conn.cursor() as cur:
             cur.call_timeout = 2 * 1000
             cur.execute(f"ALTER SESSION SET CURRENT_SCHEMA = {schema_name.upper()}")
             cur.execute(normalized)
         conn.commit()
+    else:
+        # 创建新连接
+        with oc_get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.call_timeout = 2 * 1000
+                cur.execute(f"ALTER SESSION SET CURRENT_SCHEMA = {schema_name.upper()}")
+                cur.execute(normalized)
+            conn.commit()
 
 
-def oc_run_call_statements(schema_name: str, call_plsqls: List[str]) -> Dict[int, dict]:
+def oc_run_call_statements(schema_name: str, call_plsqls: List[str], conn=None) -> Dict[int, dict]:
+    """执行调用语句并返回结果，可复用已有连接"""
     results: Dict[int, dict] = {}
-    with oc_get_connection() as conn:
+    
+    def _execute_calls(cur):
+        cur.call_timeout = 2 * 1000
+        cur.execute(f"ALTER SESSION SET CURRENT_SCHEMA = {schema_name.upper()}")
+        for idx, call_sql in enumerate(call_plsqls):
+            try:
+                cur.execute(call_sql)
+                if cur.description:
+                    rows = cur.fetchall()
+                    columns = [desc[0] for desc in cur.description]
+                    df = pd.DataFrame(rows, columns=columns)
+                else:
+                    df = pd.DataFrame()
+                results[idx] = {"sql": call_sql, "result": df}
+            except Exception as exc:
+                results[idx] = {"sql": call_sql, "result": None, "error": str(exc)}
+    
+    if conn is not None:
         with conn.cursor() as cur:
-            cur.call_timeout = 2 * 1000
-            cur.execute(f"ALTER SESSION SET CURRENT_SCHEMA = {schema_name.upper()}")
-            for idx, call_sql in enumerate(call_plsqls):
-                try:
-                    cur.execute(call_sql)
-                    if cur.description:
-                        rows = cur.fetchall()
-                        columns = [desc[0] for desc in cur.description]
-                        df = pd.DataFrame(rows, columns=columns)
-                    else:
-                        df = pd.DataFrame()
-                    results[idx] = {"sql": call_sql, "result": df}
-                except Exception as exc:
-                    results[idx] = {"sql": call_sql, "result": None, "error": str(exc)}
+            _execute_calls(cur)
+    else:
+        with oc_get_connection() as conn:
+            with conn.cursor() as cur:
+                _execute_calls(cur)
     return results
 
 
-def oc_get_all_user_tables(schema_name: str) -> List[str]:
-    with oc_get_connection() as conn:
+def oc_get_all_user_tables(schema_name: str, conn=None) -> List[str]:
+    """获取 Oracle schema 的用户表列表"""
+    def _fetch_tables(cur):
+        cur.execute(
+            """
+            SELECT table_name FROM all_tables 
+            WHERE owner = :owner 
+            ORDER BY table_name
+            """,
+            owner=schema_name.upper()
+        )
+        return [row[0] for row in cur.fetchall()]
+    
+    if conn is not None:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT table_name
-                FROM all_tables
-                WHERE owner = :schema_name
-                AND table_name NOT LIKE 'BIN$%'
-                ORDER BY table_name
-                """,
-                schema_name=schema_name.upper(),
-            )
-            rows = cur.fetchall()
-    return [row[0] for row in rows]
-
-
-def oc_get_important_system_tables() -> List[str]:
-    return ["all_constraints", "all_triggers", "all_sequences", "all_views"]
-
-
-def oc_fetch_system_table_data(system_table: str):
-    try:
+            return _fetch_tables(cur)
+    else:
         with oc_get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT CASE
-                        WHEN EXISTS (
-                            SELECT 1 FROM all_tables WHERE table_name = :tbl
-                        ) THEN 1
-                        WHEN EXISTS (
-                            SELECT 1 FROM all_views WHERE view_name = :tbl
-                        ) THEN 1
-                        ELSE 0
-                    END
-                    FROM dual
-                    """,
-                    tbl=system_table.upper(),
-                )
-                if not cur.fetchone()[0]:
-                    return None
-                cur.execute(
-                    f"SELECT * FROM {system_table} WHERE ROWNUM <= 100 ORDER BY 1"
-                )
-                return cur.fetchall()
-    except Exception as exc:
-        print(f"Warning: Could not fetch Oracle system table {system_table}: {exc}")
-        return None
+                return _fetch_tables(cur)
 
 
-def oc_capture_table_state(schema_name: str, table_names: List[str]) -> Dict[str, Optional[pd.DataFrame]]:
-    snapshots: Dict[str, Optional[pd.DataFrame]] = {}
-    with oc_get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"ALTER SESSION SET CURRENT_SCHEMA = {schema_name.upper()}")
-            for table in table_names:
-                try:
-                    cur.execute(f'SELECT * FROM "{table}" ORDER BY 1')
-                    rows = cur.fetchall()
-                    columns = [desc[0] for desc in cur.description] if cur.description else []
-                    snapshots[table] = pd.DataFrame(rows, columns=columns)
-                except Exception:
-                    snapshots[table] = None
+def oc_capture_table_state(schema_name: str, table_names: List[str], conn=None) -> Dict[str, Optional[pd.DataFrame]]:
+    """批量抓取 Oracle schema 中多个表的数据状态"""
+    snapshots = {}
+    
+    def _capture(cur):
+        cur.execute(f"ALTER SESSION SET CURRENT_SCHEMA = {schema_name.upper()}")
+        for table in table_names:
+            try:
+                cur.execute(f'SELECT * FROM "{table}" ORDER BY 1')
+                result = cur.fetchall()
+                columns = [desc[0] for desc in cur.description] if cur.description else []
+                snapshots[table] = pd.DataFrame(result, columns=columns)
+            except Exception as e:
+                print(f"Warning: Failed to capture table {table}: {e}")
+                snapshots[table] = None
+    
+    try:
+        if conn is not None:
+            with conn.cursor() as cur:
+                _capture(cur)
+        else:
+            with oc_get_connection() as conn:
+                with conn.cursor() as cur:
+                    _capture(cur)
+    except Exception as e:
+        print(f"Warning: Oracle connection failed: {e}")
+        for table in table_names:
+            if table not in snapshots:
+                snapshots[table] = None
     return snapshots
 
 
 def oc_compare_plsql_function(
-    worker_schema_name: str, 
+    worker_schema_name: str,
     original_schema_name: str,
-    plsql1: str, 
-    plsql2: str, 
+    plsql1: str,
+    plsql2: str,
     call_plsqls: List[str]
 ):
-    """比较两个 Oracle PL/SQL 函数"""
+    """比较两个 Oracle PL/SQL 函数（复用连接）"""
     try:
         worker_upper = worker_schema_name.upper()
         call_plsqls = call_plsqls or []
@@ -967,32 +1565,57 @@ def oc_compare_plsql_function(
         # ========== 第一轮 ==========
         _log(worker_schema_name, f"[Round 1] Restoring schema from {original_schema_name}.sql...")
         oc_restore_schema(worker_schema_name, original_schema_name)
-        
-        _log(worker_schema_name, f"[Round 1] Executing solution PLSQL (function)...")
-        oc_execute_plsql(worker_upper, plsql1)
-        
-        _log(worker_schema_name, f"[Round 1] Executing {len(call_plsqls)} call statement(s)...")
-        results1 = oc_run_call_statements(worker_upper, call_plsqls)
-        for i, res in results1.items():
-            if res.get("result") is not None:
-                _log(worker_schema_name, f"[Round 1] Call [{i+1}] returned {len(res['result'])} rows")
-            else:
-                _log(worker_schema_name, f"[Round 1] Call [{i+1}] failed: {res.get('error', 'unknown')}", level="WARN")
+
+        # 复用单个连接执行所有操作
+        with oc_get_connection() as conn:
+            _log(worker_schema_name, f"[Round 1] Executing solution PLSQL (function)...")
+            try:
+                oc_execute_plsql(worker_upper, plsql1, conn=conn)
+            except Exception as e:
+                _log(worker_schema_name, f"[Round 1] Failed to execute solution PLSQL: {e}", level="ERROR")
+                return 0.0
+
+            _log(worker_schema_name, f"[Round 1] Executing {len(call_plsqls)} call statement(s)...")
+            results1 = oc_run_call_statements(worker_upper, call_plsqls, conn=conn)
 
         # ========== 第二轮 ==========
         _log(worker_schema_name, f"[Round 2] Restoring schema from {original_schema_name}.sql...")
         oc_restore_schema(worker_schema_name, original_schema_name)
-        
-        _log(worker_schema_name, f"[Round 2] Executing ground truth PLSQL (function)...")
-        oc_execute_plsql(worker_upper, plsql2)
-        
-        _log(worker_schema_name, f"[Round 2] Executing {len(call_plsqls)} call statement(s)...")
-        results2 = oc_run_call_statements(worker_upper, call_plsqls)
-        for i, res in results2.items():
-            if res.get("result") is not None:
-                _log(worker_schema_name, f"[Round 2] Call [{i+1}] returned {len(res['result'])} rows")
-            else:
-                _log(worker_schema_name, f"[Round 2] Call [{i+1}] failed: {res.get('error', 'unknown')}", level="WARN")
+
+        # 复用单个连接执行所有操作（带重试机制）
+        last_error = None
+        for attempt in range(_OC_MAX_RETRIES):
+            try:
+                with oc_get_connection() as conn:
+                    _log(worker_schema_name, f"[Round 2] Executing ground truth PLSQL (function)...")
+                    oc_execute_plsql(worker_upper, plsql2, conn=conn)
+
+                    _log(worker_schema_name, f"[Round 2] Executing {len(call_plsqls)} call statement(s)...")
+                    results2 = oc_run_call_statements(worker_upper, call_plsqls, conn=conn)
+                break  # 成功则退出重试循环
+            except oracledb.Error as e:
+                last_error = e
+                error_msg = str(e).lower()
+                # 可重试的连接错误
+                is_retryable = any(x in error_msg for x in _OC_RETRYABLE_ERRORS)
+                _log(worker_schema_name, f"[Round 2] Oracle error (attempt {attempt + 1}/{_OC_MAX_RETRIES}): {e}, retryable={is_retryable}", level="WARN")
+                
+                if is_retryable and attempt < _OC_MAX_RETRIES - 1:
+                    time.sleep(_OC_RETRY_DELAY * (attempt + 1))
+                    # 重试前重新恢复 schema
+                    try:
+                        oc_restore_schema(worker_schema_name, original_schema_name)
+                    except Exception as restore_e:
+                        _log(worker_schema_name, f"[Round 2] Failed to restore schema for retry: {restore_e}", level="ERROR")
+                    continue
+                elif is_retryable:
+                    # 最后一次重试也失败了
+                    _log(worker_schema_name, f"[Round 2] All {_OC_MAX_RETRIES} retries exhausted", level="ERROR")
+                raise
+        else:
+            # 所有重试都失败（for-else 只有在没有 break 时才执行）
+            if last_error:
+                raise last_error
 
         # ========== 比较 ==========
         total_calls = len(call_plsqls)
@@ -1040,7 +1663,7 @@ def oc_compare_plsql(
     plsql2: str, 
     call_plsqls: List[str]
 ):
-    """比较两个 Oracle PL/SQL 对表的影响"""
+    """比较两个 Oracle PL/SQL 对表的影响（优化：复用连接）"""
     try:
         worker_upper = worker_schema_name.upper()
         call_plsqls = call_plsqls or []
@@ -1049,45 +1672,77 @@ def oc_compare_plsql(
         _log(worker_schema_name, f"[Round 1] Restoring schema from {original_schema_name}.sql...")
         oc_restore_schema(worker_schema_name, original_schema_name)
 
-        all_user_tables = oc_get_all_user_tables(worker_upper)
-        _log(worker_schema_name, f"[Round 1] Found {len(all_user_tables)} user tables: {all_user_tables}")
-        
-        _log(worker_schema_name, f"[Round 1] Executing solution PLSQL...")
-        try:
-            oc_execute_plsql(worker_upper, plsql1)
-        except Exception as e:
-            _log(worker_schema_name, f"[Round 1] Failed to execute solution PLSQL: {e}", level="ERROR")
-            return 0.0
-        
-        _log(worker_schema_name, f"[Round 1] Executing {len(call_plsqls)} call statement(s)...")
+        # 复用单个连接执行所有操作
         round1_call_failed = False
-        for i, call in enumerate(call_plsqls):
-            _log(worker_schema_name, f"[Round 1] Executing call [{i+1}]: {call[:100]}...")
+        with oc_get_connection() as conn:
+            all_user_tables = oc_get_all_user_tables(worker_upper, conn=conn)
+            _log(worker_schema_name, f"[Round 1] Found {len(all_user_tables)} user tables: {all_user_tables}")
+            
+            _log(worker_schema_name, f"[Round 1] Executing solution PLSQL...")
             try:
-                oc_execute_plsql(worker_upper, call)
+                oc_execute_plsql(worker_upper, plsql1, conn=conn)
             except Exception as e:
-                _log(worker_schema_name, f"[Round 1] Call [{i+1}] failed: {e}", level="WARN")
-                round1_call_failed = True
+                _log(worker_schema_name, f"[Round 1] Failed to execute solution PLSQL: {e}", level="ERROR")
+                return 0.0
+            
+            _log(worker_schema_name, f"[Round 1] Executing {len(call_plsqls)} call statement(s)...")
+            for i, call in enumerate(call_plsqls):
+                _log(worker_schema_name, f"[Round 1] Executing call [{i+1}]: {call[:100]}...")
+                try:
+                    oc_execute_plsql(worker_upper, call, conn=conn)
+                except Exception as e:
+                    _log(worker_schema_name, f"[Round 1] Call [{i+1}] failed: {e}", level="WARN")
+                    round1_call_failed = True
 
-        user_tables_results1 = oc_capture_table_state(worker_upper, all_user_tables)
+            user_tables_results1 = oc_capture_table_state(worker_upper, all_user_tables, conn=conn)
 
         # ========== 第二轮 ==========
         _log(worker_schema_name, f"[Round 2] Restoring schema from {original_schema_name}.sql...")
         oc_restore_schema(worker_schema_name, original_schema_name)
         
-        _log(worker_schema_name, f"[Round 2] Executing ground truth PLSQL...")
-        oc_execute_plsql(worker_upper, plsql2)
-        _log(worker_schema_name, f"[Round 2] Executing {len(call_plsqls)} call statement(s)...")
+        # 复用单个连接执行所有操作（带重试机制）
         round2_call_failed = False
-        for i, call in enumerate(call_plsqls):
-            _log(worker_schema_name, f"[Round 2] Executing call [{i+1}]: {call[:100]}...")
+        last_error = None
+        for attempt in range(_OC_MAX_RETRIES):
             try:
-                oc_execute_plsql(worker_upper, call)
-            except Exception as e:
-                _log(worker_schema_name, f"[Round 2] Call [{i+1}] failed: {e}", level="WARN")
-                round2_call_failed = True
+                with oc_get_connection() as conn:
+                    _log(worker_schema_name, f"[Round 2] Executing ground truth PLSQL...")
+                    oc_execute_plsql(worker_upper, plsql2, conn=conn)
+                    
+                    _log(worker_schema_name, f"[Round 2] Executing {len(call_plsqls)} call statement(s)...")
+                    for i, call in enumerate(call_plsqls):
+                        _log(worker_schema_name, f"[Round 2] Executing call [{i+1}]: {call[:100]}...")
+                        try:
+                            oc_execute_plsql(worker_upper, call, conn=conn)
+                        except Exception as e:
+                            _log(worker_schema_name, f"[Round 2] Call [{i+1}] failed: {e}", level="WARN")
+                            round2_call_failed = True
 
-        user_tables_results2 = oc_capture_table_state(worker_upper, all_user_tables)
+                    user_tables_results2 = oc_capture_table_state(worker_upper, all_user_tables, conn=conn)
+                break  # 成功则退出重试循环
+            except oracledb.Error as e:
+                last_error = e
+                error_msg = str(e).lower()
+                # 可重试的连接错误
+                is_retryable = any(x in error_msg for x in _OC_RETRYABLE_ERRORS)
+                _log(worker_schema_name, f"[Round 2] Oracle error (attempt {attempt + 1}/{_OC_MAX_RETRIES}): {e}, retryable={is_retryable}", level="WARN")
+                
+                if is_retryable and attempt < _OC_MAX_RETRIES - 1:
+                    time.sleep(_OC_RETRY_DELAY * (attempt + 1))
+                    # 重试前重新恢复 schema
+                    try:
+                        oc_restore_schema(worker_schema_name, original_schema_name)
+                    except Exception as restore_e:
+                        _log(worker_schema_name, f"[Round 2] Failed to restore schema for retry: {restore_e}", level="ERROR")
+                    continue
+                elif is_retryable:
+                    # 最后一次重试也失败了
+                    _log(worker_schema_name, f"[Round 2] All {_OC_MAX_RETRIES} retries exhausted", level="ERROR")
+                raise
+        else:
+            # 所有重试都失败（for-else 只有在没有 break 时才执行）
+            if last_error:
+                raise last_error
 
         # 如果 solution 执行失败但 ground_truth 成功，返回 0
         if round1_call_failed and not round2_call_failed:
